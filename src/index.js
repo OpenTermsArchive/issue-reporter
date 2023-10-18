@@ -1,215 +1,144 @@
-import fs from 'fs';
+import mime from 'mime';
 
-import { Octokit } from 'octokit';
+import GitHub from './github.js';
 
-import logger from '../logger/index.js';
+const CONTRIBUTION_TOOL_URL = 'https://contribute.opentermsarchive.org/en/service';
+const DOC_URL = 'https://docs.opentermsarchive.org';
 
-const { version } = JSON.parse(fs.readFileSync(new URL('../../package.json', import.meta.url)).toString());
+const ERROR_MESSAGE_TO_ISSUE_LABEL_MAP = {
+  'has no match': 'selectors',
+  'HTTP code 404': 'location',
+  'HTTP code 403': '403',
+  'HTTP code 429': '429',
+  'HTTP code 500': '500',
+  'HTTP code 502': '502',
+  'HTTP code 503': '503',
+  'Timed out after': 'timeout',
+  'getaddrinfo EAI_AGAIN': 'EAI_AGAIN',
+  'getaddrinfo ENOTFOUND': 'ENOTFOUND',
+  'Response is empty': 'empty response',
+  'unable to verify the first certificate': 'first certificate',
+  'certificate has expired': 'certificate expired',
+  'maximum redirect reached': 'redirects',
+};
 
-const ISSUE_STATE_CLOSED = 'closed';
-const ISSUE_STATE_OPEN = 'open';
-const ISSUE_STATE_ALL = 'all';
+function getLabelNameFromError(error) {
+  return ERROR_MESSAGE_TO_ISSUE_LABEL_MAP[Object.keys(ERROR_MESSAGE_TO_ISSUE_LABEL_MAP).find(substring => error.toString().includes(substring))] || 'to clarify';
+}
 
-const CONTRIBUTE_URL = 'https://contribute.opentermsarchive.org/en/service';
-const GOOGLE_URL = 'https://www.google.com/search?q=';
+// In the following class, it is assumed that each issue is managed using its title as a unique identifier
+export default class Reporter {
+  constructor(config) {
+    const { repositories } = config.githubIssues;
 
-export default class Tracker {
-  static isRepositoryValid(repository) {
-    return repository.includes('/');
-  }
-
-  constructor(trackerConfig) {
-    const { repository, label } = trackerConfig.githubIssues;
-
-    if (!Tracker.isRepositoryValid(repository)) {
-      throw new Error('tracker.githubIssues.repository should be a string with <owner>/<repo>');
+    for (const repositoryType of Object.keys(repositories)) {
+      if (!repositories[repositoryType].includes('/') || repositories[repositoryType].includes('https://')) {
+        throw new Error(`Configuration entry "reporter.githubIssues.repositories.${repositoryType}" is expected to be a string in the format <owner>/<repo>, but received: "${repositories[repositoryType]}"`);
+      }
     }
 
-    const [ owner, repo ] = repository.split('/');
-
-    this.octokit = new Octokit({
-      auth: process.env.GITHUB_TOKEN,
-      userAgent: `opentermsarchive/${version}`,
-    });
-    this.cachedIssues = {};
-    this.commonParams = {
-      owner,
-      repo,
-      accept: 'application/vnd.github.v3+json',
-    };
-    this.repository = repository;
-    this.label = label;
+    this.github = new GitHub(repositories.declarations);
+    this.repositories = repositories;
   }
 
   async initialize() {
-    await this.createLabel({
-      name: this.label.name,
-      color: this.label.color,
-      description: this.label.description,
+    return this.github.initialize();
+  }
+
+  async onVersionRecorded(version) {
+    await this.github.closeIssueWithCommentIfExists({
+      title: Reporter.generateTitleID(version.serviceId, version.termsType),
+      comment: `### Tracking resumed
+
+A new version has been recorded.`,
     });
   }
 
-  async onVersionRecorded(serviceId, type) {
-    await this.closeIssueIfExists({
-      labels: [this.label.name],
-      title: `Fix ${serviceId} - ${type}`,
-      comment: '🤖 Closed automatically as data was gathered successfully',
+  async onVersionNotChanged(version) {
+    await this.github.closeIssueWithCommentIfExists({
+      title: Reporter.generateTitleID(version.serviceId, version.termsType),
+      comment: `### Tracking resumed
+
+No changes were found in the last run, so no new version has been recorded.`,
     });
   }
 
-  async onVersionNotChanged(serviceId, type) {
-    await this.closeIssueIfExists({
-      labels: [this.label.name],
-      title: `Fix ${serviceId} - ${type}`,
-      comment: '🤖 Closed automatically as version is unchanged but data has been fetched correctly',
-    });
-  }
-
-  async onFirstVersionRecorded(serviceId, type) {
-    return this.onVersionRecorded(serviceId, type);
+  async onFirstVersionRecorded(version) {
+    return this.onVersionRecorded(version);
   }
 
   async onInaccessibleContent(error, terms) {
-    const { title, body } = Tracker.formatIssueTitleAndBody({ message: error.toString(), repository: this.repository, terms });
-
-    await this.createIssueIfNotExists({
-      title,
-      body,
-      labels: [this.label.name],
-      comment: '🤖 Reopened automatically as an error occured',
+    await this.github.createOrUpdateIssue({
+      title: Reporter.generateTitleID(terms.service.id, terms.type),
+      description: this.generateDescription({ error, terms }),
+      label: getLabelNameFromError(error),
     });
   }
 
-  async createLabel(params) {
-    return this.octokit.rest.issues.createLabel({ ...this.commonParams, ...params })
-      .catch(error => {
-        if (error.toString().includes('"code":"already_exists"')) {
-          return;
-        }
-        logger.error(`Could not create label "${params.name}": ${error.toString()}`);
-      });
-  }
+  generateDescription({ error, terms }) {
+    const date = new Date();
+    const currentFormattedDate = date.toLocaleDateString('en-GB', { year: 'numeric', month: 'long', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric', timeZoneName: 'short', timeZone: 'UTC' });
+    const validUntil = date.toISOString().replace(/\.\d+/, ''); // ISO date without milliseconds
 
-  async createIssue(params) {
-    const { data } = await this.octokit.rest.issues.create(params);
+    const hasSnapshots = terms.sourceDocuments.every(sourceDocument => sourceDocument.snapshotId);
 
-    return data;
-  }
-
-  async searchIssues({ title, ...searchParams }) {
-    const request = {
-      per_page: 100,
-      ...searchParams,
-    };
-
-    const issues = await this.octokit.paginate(
-      this.octokit.rest.issues.listForRepo,
-      request,
-      response => response.data,
-    );
-
-    const issuesWithSameTitle = issues.filter(item => item.title === title);
-
-    return issuesWithSameTitle;
-  }
-
-  async addCommentToIssue(params) {
-    const { data } = await this.octokit.rest.issues.createComment(params);
-
-    return data;
-  }
-
-  async createIssueIfNotExists({ title, body, labels, comment }) {
-    try {
-      const existingIssues = await this.searchIssues({ ...this.commonParams, title, labels, state: ISSUE_STATE_ALL });
-
-      if (!existingIssues.length) {
-        const existingIssue = await this.createIssue({ ...this.commonParams, title, body, labels });
-
-        logger.info(`🤖 Creating GitHub issue for ${title}: ${existingIssue.html_url}`);
-
-        return;
-      }
-
-      const openedIssues = existingIssues.filter(existingIssue => existingIssue.state === ISSUE_STATE_OPEN);
-      const hasNoneOpened = openedIssues.length === 0;
-
-      for (const existingIssue of existingIssues) {
-        if (hasNoneOpened) {
-          try {
-            /* eslint-disable no-await-in-loop */
-            await this.octokit.rest.issues.update({
-              ...this.commonParams,
-              issue_number: existingIssue.number,
-              state: ISSUE_STATE_OPEN,
-            });
-            await this.addCommentToIssue({
-              ...this.commonParams,
-              issue_number: existingIssue.number,
-              body: `${comment}\n${body}`,
-            });
-            /* eslint-enable no-await-in-loop */
-            logger.info(`🤖 Reopened automatically as an error occured for ${title}: ${existingIssue.html_url}`);
-          } catch (e) {
-            logger.error(`🤖 Could not update GitHub issue ${existingIssue.html_url}: ${e}`);
-          }
-          break;
-        }
-      }
-    } catch (e) {
-      logger.error(`🤖 Could not create GitHub issue for ${title}: ${e}`);
-    }
-  }
-
-  async closeIssueIfExists({ title, comment, labels }) {
-    try {
-      const openedIssues = await this.searchIssues({ ...this.commonParams, title, labels, state: ISSUE_STATE_OPEN });
-
-      for (const openedIssue of openedIssues) {
-        try {
-          await this.octokit.rest.issues.update({ ...this.commonParams, issue_number: openedIssue.number, state: ISSUE_STATE_CLOSED }); // eslint-disable-line no-await-in-loop
-          await this.addCommentToIssue({ ...this.commonParams, issue_number: openedIssue.number, body: comment }); // eslint-disable-line no-await-in-loop
-          logger.info(`🤖 GitHub issue closed for ${title}: ${openedIssue.html_url}`);
-        } catch (e) {
-          logger.error(`🤖 Could not close GitHub issue ${openedIssue.html_url}: ${e.toString()}`);
-        }
-      }
-    } catch (e) {
-      logger.error(`🤖 Could not close GitHub issue for ${title}: ${e}`);
-    }
-  }
-
-  static formatIssueTitleAndBody({ message, repository, terms }) {
-    const { service: { name }, type } = terms;
-    const json = terms.toPersistence();
-    const title = `Fix ${name} - ${type}`;
-
-    const encodedName = encodeURIComponent(name);
-    const encodedType = encodeURIComponent(type);
-
-    const urlQueryParams = new URLSearchParams({
-      json: JSON.stringify(json),
-      destination: repository,
-      expertMode: 'true',
+    const contributionToolParams = new URLSearchParams({
+      json: JSON.stringify(terms.toPersistence()),
+      destination: this.repositories.declarations,
       step: '2',
     });
+    const contributionToolUrl = `${CONTRIBUTION_TOOL_URL}?${contributionToolParams}`;
 
-    const body = `
-These terms are no longer tracked.
+    const latestDeclarationLink = `[Latest declaration](https://github.com/${this.repositories.declarations}/blob/main/declarations/${encodeURIComponent(terms.service.name)}.json)`;
+    const latestVersionLink = `[Latest version](https://github.com/${this.repositories.versions}/blob/main/${encodeURIComponent(terms.service.name)}/${encodeURIComponent(terms.type)}.md)`;
+    const snapshotsBaseUrl = `https://github.com/${this.repositories.snapshots}/blob/main/${encodeURIComponent(terms.service.name)}/${encodeURIComponent(terms.type)}`;
+    const latestSnapshotsLink = terms.hasMultipleSourceDocuments
+      ? `Latest snapshots:\n  - ${terms.sourceDocuments.map(sourceDocument => `[${sourceDocument.id}](${snapshotsBaseUrl}.%20#${sourceDocument.id}.${mime.getExtension(sourceDocument.mimeType)})`).join('\n  - ')}`
+      : `[Latest snapshot](${snapshotsBaseUrl}.${mime.getExtension(terms.sourceDocuments[0].mimeType)})`;
 
-${message}
+    /* eslint-disable no-irregular-whitespace */
+    return `
+### No version of the \`${terms.type}\` of service \`${terms.service.name}\` is recorded anymore since ${currentFormattedDate}
 
-Check what's wrong by:
-- Using the [online contribution tool](${CONTRIBUTE_URL}?${urlQueryParams}).
-${message.includes('404') ? `- [Searching Google](${GOOGLE_URL}%22${encodedName}%22+%22${encodedType}%22) to get for a new URL.` : ''}
+The source document${terms.hasMultipleSourceDocuments ? 's have' : ' has'}${hasSnapshots ? ' ' : ' not '}been recorded in ${terms.hasMultipleSourceDocuments ? 'snapshots' : 'a snapshot'}, ${hasSnapshots ? 'but ' : 'thus '} no version can be [extracted](${DOC_URL}/#tracking-terms).
+${hasSnapshots ? 'After correction, it might still be possible to recover the missed versions.' : ''}
 
-And some info about what has already been tracked:
-- See [service declaration JSON file](https://github.com/${repository}/blob/main/declarations/${encodedName}.json).
+### What went wrong
+
+- ${error.reasons.join('\n- ')}
+
+### How to resume tracking
+
+First of all, check if the source documents are accessible through a web browser:
+
+- [ ] ${terms.sourceDocuments.map(sourceDocument => `[${sourceDocument.location}](${sourceDocument.location})`).join('\n- [ ] ')}
+
+#### If the source documents are accessible through a web browser
+
+[Edit the declaration](${contributionToolUrl}):
+- Try updating the selectors.
+- Try switching client scripts on with expert mode.
+
+#### If the source documents are not accessible anymore
+
+- If the source documents have moved, find their new location and [update it](${contributionToolUrl}).
+- If these terms have been removed, move them from the declaration to its [history file](${DOC_URL}/contributing-terms/#service-history), using \`${validUntil}\` as the \`validUntil\` value.
+- If the service has closed, move the entire contents of the declaration to its [history file](${DOC_URL}/contributing-terms/#service-history), using \`${validUntil}\` as the \`validUntil\` value.
+
+#### If none of the above works
+
+If the source documents are accessible in a browser but fetching them always fails from the Open Terms Archive server, this is most likely because the service provider has blocked the Open Terms Archive robots from accessing its content. In this case, updating the declaration will not enable resuming tracking. Only an agreement with the service provider, an engine upgrade, or some technical workarounds provided by the administrator of this collection’s server might resume tracking.
+
+### References
+
+- ${latestDeclarationLink}
+- ${latestVersionLink}
+- ${latestSnapshotsLink}
 `;
+  /* eslint-enable no-irregular-whitespace */
+  }
 
-    return {
-      title,
-      body,
-    };
+  static generateTitleID(serviceId, type) {
+    return `\`${serviceId}\` ‧ \`${type}\` ‧ not tracked anymore`;
   }
 }
