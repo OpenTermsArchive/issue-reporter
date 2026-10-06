@@ -1,13 +1,15 @@
 import mime from 'mime';
 
-import { toISODateWithoutMilliseconds } from '../archivist/utils/date.js';
-import logger from '../logger/index.js';
-
-import { createReporter } from './factory.js';
+import { createForge } from './factory.js';
 import { LABELS } from './labels.js';
+import logger from './logger.js';
 
 const CONTRIBUTION_TOOL_URL = 'https://contribute.opentermsarchive.org/en/service';
 const DOC_URL = 'https://docs.opentermsarchive.org';
+
+export const STATUSES = Object.freeze({ ok: 'ok', failed: 'failed' }); // Statuses of a tracking result, as the Collection API serves them
+
+export const UNDECLARED_CLOSING_THRESHOLD = 0.9; // Share of the declared terms that must have a tracking result for the issues of terms reported as no longer declared to be closed: a Collection API started on an incomplete declarations directory reports terms as undeclared, and closing their issues would only reopen them all at the next run. The flag is computed by the Collection API from the declarations loaded at its start, so it is only accurate when the API restarts along with the tracker, as a deployment does
 
 const ERROR_MESSAGE_TO_ISSUE_LABELS_MAP = {
   'has no match': [ LABELS.DOCUMENT_STRUCTURE_CHANGE.name, LABELS.NEEDS_INTERVENTION.name ],
@@ -28,147 +30,137 @@ const ERROR_MESSAGE_TO_ISSUE_LABELS_MAP = {
   'empty content': [LABELS.EMPTY_CONTENT.name],
 };
 
-function getLabelNamesFromError(error) {
-  return ERROR_MESSAGE_TO_ISSUE_LABELS_MAP[Object.keys(ERROR_MESSAGE_TO_ISSUE_LABELS_MAP).find(substring => error.toString().includes(substring))] || [LABELS.UNKNOWN_FAILURE.name];
+export function getLabelNamesFromReasons(reasons = []) { // Reasons carry the engine error messages, prefixed by their category
+  const text = reasons.join('\n');
+
+  return ERROR_MESSAGE_TO_ISSUE_LABELS_MAP[Object.keys(ERROR_MESSAGE_TO_ISSUE_LABELS_MAP).find(substring => text.includes(substring))] || [LABELS.UNKNOWN_FAILURE.name];
 }
 
 // In the following class, it is assumed that each issue is managed using its title as a unique identifier
 export default class Reporter {
   constructor(config) {
-    const normalizedConfig = Reporter.normalizeConfig(config);
+    Reporter.validateConfiguration(config);
 
-    Reporter.validateConfiguration(normalizedConfig.repositories);
+    this.forge = createForge(config);
+    this.repositories = config.repositories;
 
-    this.reporter = createReporter(normalizedConfig);
-    this.repositories = normalizedConfig.repositories;
+    const tokenVariable = this.forge.constructor.TOKEN_ENVIRONMENT_VARIABLE;
+
+    if (!process.env[tokenVariable]) {
+      throw new Error(`Environment variable "${tokenVariable}" is required to manage issues on ${config.type}`);
+    }
   }
 
-  /**
-   * Support for legacy config format where reporter configuration was nested under `githubIssues`
-   * @example
-   * ```json
-   * {
-   *   "githubIssues": {
-   *     "repositories": {
-   *       "declarations": "OpenTermsArchive/sandbox-declarations"
-   *     }
-   *   }
-   * }
-   * ```
-   * @param   {object} config - The configuration object to normalize
-   * @returns {object}        The normalized configuration object
-   * @deprecated
-   * @private
-   */
-  static normalizeConfig(config) {
-    if (config.githubIssues) {
-      logger.warn('The "reporter.githubIssues" key is deprecated; please see configuration documentation for the new format: https://docs.opentermsarchive.org/#configuring');
-
-      return {
-        type: 'github',
-        repositories: config.githubIssues.repositories,
-      };
+  static validateConfiguration(config) {
+    if (!config.repositories?.declarations) {
+      throw new Error('Required configuration key "repositories.declarations" was not found; issues on the declarations repository cannot be created');
     }
 
-    return config;
-  }
-
-  static validateConfiguration(repositories) {
-    if (!repositories?.declarations) {
-      throw new Error('Required configuration key "reporter.repositories.declarations" was not found; issues on the declarations repository cannot be created');
-    }
-
-    for (const [ type, repo ] of Object.entries(repositories)) {
+    for (const [ type, repo ] of Object.entries(config.repositories)) {
       if (!repo.includes('/') || repo.includes('https://')) {
-        throw new Error(`Configuration entry "reporter.repositories.${type}" is expected to be a string in the format <owner>/<repo>, but received: "${repo}"`);
+        throw new Error(`Configuration entry "repositories.${type}" is expected to be a string in the format <owner>/<repo>, but received: "${repo}"`);
       }
     }
   }
 
   initialize() {
-    return this.reporter.initialize();
+    return this.forge.initialize();
   }
 
-  onTrackingStarted() {
-    return this.reporter.clearCache();
+  async sync({ run, results }) { // Reconciles the issues with the tracking results of one completed run. An issue is only opened, updated or closed on the positive evidence of a tracking result and terms without result are left untouched, so the same run can be synchronized again safely
+    await this.forge.loadIssues(); // Reloaded at each synchronization, as issues may have been edited by hand meanwhile
+
+    const undeclaredCount = results.filter(result => !result.declared).length;
+    const declaredCount = results.length - undeclaredCount;
+    const closeUndeclared = declaredCount >= run.declarations.terms * UNDECLARED_CLOSING_THRESHOLD;
+
+    if (undeclaredCount && !closeUndeclared) {
+      logger.warn(`Only ${declaredCount} of the ${run.declarations.terms} declared terms have a tracking result; the issues of the ${undeclaredCount} terms reported as no longer declared are kept open, in case the Collection API was started on an incomplete declarations directory`);
+    }
+
+    let failures = 0;
+
+    for (const result of results) {
+      try {
+        await this.report(result, { closeUndeclared });
+      } catch (error) {
+        failures++;
+        logger.error(`Could not report the tracking result of ${result.serviceId} ${result.termsType}: ${error.stack}`);
+      }
+    }
+
+    if (failures) {
+      throw new Error(`${failures} of ${results.length} tracking results could not be reported`);
+    }
   }
 
-  async onVersionRecorded(version) {
-    await this.reporter.closeIssueWithCommentIfExists({
-      title: Reporter.generateTitleID(version.serviceId, version.termsType),
-      comment: `### Tracking resumed
+  report(result, { closeUndeclared }) {
+    const title = Reporter.generateTitle(result.serviceId, result.termsType);
 
-A new version has been recorded.`,
-    });
+    if (!result.declared) {
+      return closeUndeclared ? this.forge.closeIssueWithCommentIfExists({ title, comment: NO_LONGER_DECLARED_COMMENT }) : undefined;
+    }
+
+    if (result.status === STATUSES.failed) {
+      return this.forge.createOrUpdateIssue({
+        title,
+        description: this.generateDescription(result),
+        labels: getLabelNamesFromReasons(result.event.reasons),
+      });
+    }
+
+    return this.forge.closeIssueWithCommentIfExists({ title, comment: generateTrackingResumedComment(result.event.date) });
   }
 
-  async onVersionNotChanged(version) {
-    await this.reporter.closeIssueWithCommentIfExists({
-      title: Reporter.generateTitleID(version.serviceId, version.termsType),
-      comment: `### Tracking resumed
-
-No changes were found in the last run, so no new version has been recorded.`,
-    });
-  }
-
-  onFirstVersionRecorded(version) {
-    return this.onVersionRecorded(version);
-  }
-
-  async onInaccessibleContent(error, terms) {
-    await this.reporter.createOrUpdateIssue({
-      title: Reporter.generateTitleID(terms.service.id, terms.type),
-      description: this.generateDescription({ error, terms }),
-      labels: getLabelNamesFromError(error),
-    });
-  }
-
-  generateDescription({ error, terms }) {
-    const date = new Date();
-    const currentFormattedDate = date.toLocaleDateString('en-GB', { year: 'numeric', month: 'long', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric', timeZoneName: 'short', timeZone: 'UTC' });
-    const validUntil = toISODateWithoutMilliseconds(date);
-
-    const hasSnapshots = terms.sourceDocuments.every(sourceDocument => sourceDocument.snapshotId);
+  generateDescription({ serviceId, termsType, event }) {
+    const { serviceName, sourceDocuments, reasons } = event;
+    const statusDate = new Date(event.date);
+    const formattedStatusDate = formatDate(statusDate);
+    const validUntil = toISODateWithoutMilliseconds(statusDate);
+    const hasMultipleSourceDocuments = sourceDocuments.length > 1;
+    const hasSnapshots = sourceDocuments.every(sourceDocument => sourceDocument.snapshotId);
 
     const contributionToolParams = new URLSearchParams({
-      json: JSON.stringify(terms.toPersistence()),
+      json: JSON.stringify(toDeclaration({ serviceName, termsType, sourceDocuments })),
       destination: this.repositories.declarations,
       step: '2',
     });
     const contributionToolUrl = `${CONTRIBUTION_TOOL_URL}?${contributionToolParams}`;
 
-    const declarationFileUrl = this.reporter.generateDeclarationURL(terms.service.id);
-    const updateDeclarationLink = terms.hasMultipleSourceDocuments ? `[on GitHub](${declarationFileUrl})` : `[on the contribution tool](${contributionToolUrl})`;
-    const multiDocumentsUpdateInfo = terms.hasMultipleSourceDocuments ? ' (the contribution tool does not support multi-document)' : '';
+    const declarationFileUrl = this.forge.generateDeclarationURL(serviceId);
+    const updateDeclarationLink = hasMultipleSourceDocuments ? `[on GitHub](${declarationFileUrl})` : `[on the contribution tool](${contributionToolUrl})`;
+    const multiDocumentsUpdateInfo = hasMultipleSourceDocuments ? ' (the contribution tool does not support multi-document)' : '';
 
     const latestDeclarationLink = `[Latest declaration](${declarationFileUrl})`;
-    const latestVersionLink = `[Latest version](${this.reporter.generateVersionURL(terms.service.id, terms.type)})`;
-    const snapshotsBaseUrl = this.reporter.generateSnapshotsBaseUrl(terms.service.id, terms.type);
-    const recordedSourceDocuments = terms.sourceDocuments.filter(sourceDocument => sourceDocument.snapshotId); // A source document that has never been recorded has no snapshot file to link to, and its unknown MIME type would produce a link to a nonexistent ".null" file
+    const latestVersionLink = `[Latest version](${this.forge.generateVersionURL(serviceId, termsType)})`;
+    const snapshotsBaseUrl = this.forge.generateSnapshotsBaseUrl(serviceId, termsType);
+    const recordedSourceDocuments = sourceDocuments.filter(sourceDocument => sourceDocument.snapshotId); // A source document that has never been recorded has no snapshot file to link to, and its unknown MIME type would produce a link to a nonexistent ".null" file
     let latestSnapshotsLink = '';
 
     if (recordedSourceDocuments.length) {
-      latestSnapshotsLink = terms.hasMultipleSourceDocuments
+      latestSnapshotsLink = hasMultipleSourceDocuments
         ? `Latest snapshots:\n  - ${recordedSourceDocuments.map(sourceDocument => `[${sourceDocument.id}](${snapshotsBaseUrl}.%20#${sourceDocument.id}.${mime.getExtension(sourceDocument.mimeType)})`).join('\n  - ')}`
         : `[Latest snapshot](${snapshotsBaseUrl}.${mime.getExtension(recordedSourceDocuments[0].mimeType)})`;
     }
 
     /* eslint-disable no-irregular-whitespace */
     return `
-### No version of the \`${terms.type}\` of service \`${terms.service.name}\` is recorded anymore since ${currentFormattedDate}
+### No version of the \`${termsType}\` of service \`${serviceName}\` is recorded anymore
 
-The source document${terms.hasMultipleSourceDocuments ? 's have' : ' has'}${hasSnapshots ? ' ' : ' not '}been recorded as ${terms.hasMultipleSourceDocuments ? 'snapshots' : 'a snapshot'}, ${hasSnapshots ? 'but ' : 'thus '} no version can be [extracted](${DOC_URL}/concepts/main/#tracking-terms).
+The tracking status last changed on ${formattedStatusDate}.
+
+The source document${hasMultipleSourceDocuments ? 's have' : ' has'}${hasSnapshots ? ' ' : ' not '}been recorded as ${hasMultipleSourceDocuments ? 'snapshots' : 'a snapshot'}, ${hasSnapshots ? 'but ' : 'thus '} no version can be [extracted](${DOC_URL}/concepts/main/#tracking-terms).
 ${hasSnapshots ? 'After correction, it might still be possible to recover the missed versions.' : ''}
 
 ### What went wrong
 
-- ${error.reasons.join('\n- ')}
+- ${reasons.join('\n- ')}
 
 ### How to resume tracking
 
 First of all, check if the source documents are accessible through a web browser:
 
-- [ ] ${terms.sourceDocuments.map(sourceDocument => `[${sourceDocument.location}](${sourceDocument.location})`).join('\n- [ ] ')}
+- [ ] ${sourceDocuments.map(sourceDocument => `[${sourceDocument.fetch}](${sourceDocument.fetch})`).join('\n- [ ] ')}
 
 #### If the source documents are accessible through a web browser
 
@@ -184,7 +176,7 @@ Edit the declaration ${updateDeclarationLink}${multiDocumentsUpdateInfo}:
 
 #### If none of the above works
 
-If the source documents are accessible in a browser but fetching them always fails from the Open Terms Archive server, this is most likely because the service provider has blocked the Open Terms Archive robots from accessing its content. In this case, updating the declaration will not enable resuming tracking. Only an agreement with the service provider, an engine upgrade, or some technical workarounds provided by the administrator of this collection’s server might resume tracking.
+If the source documents are accessible in a browser but fetching them always fails from the Open Terms Archive server, this is most likely because the service provider has blocked the Open Terms Archive robots from accessing its content. In this case, updating the declaration will not enable resuming tracking. Only an agreement with the service provider, an engine upgrade, or some technical workarounds provided by the administrator of this collection’s server might resume tracking.
 
 ### References
 
@@ -195,7 +187,34 @@ ${this.repositories.snapshots && latestSnapshotsLink ? `- ${latestSnapshotsLink}
   /* eslint-enable no-irregular-whitespace */
   }
 
-  static generateTitleID(serviceId, type) {
-    return `\`${serviceId}\` ‧ \`${type}\` ‧ not tracked anymore`;
+  static generateTitle(serviceId, termsType) {
+    return `\`${serviceId}\` ‧ \`${termsType}\` ‧ not tracked anymore`;
   }
+}
+
+const NO_LONGER_DECLARED_COMMENT = `### Tracking stopped
+
+These terms are no longer declared in this collection.`;
+
+function generateTrackingResumedComment(date) {
+  return `### Tracking resumed
+
+These terms have been tracked successfully since ${formatDate(new Date(date))}.`;
+}
+
+function toDeclaration({ serviceName, termsType, sourceDocuments }) { // Rebuilds the declaration the contribution tool expects from the declared fields that the tracking result carries for each source document
+  const declarations = sourceDocuments.map(({ id, mimeType, snapshotId, ...declaration }) => declaration); // eslint-disable-line no-unused-vars
+
+  return {
+    name: serviceName,
+    terms: { [termsType]: declarations.length > 1 ? { combine: declarations } : declarations[0] },
+  };
+}
+
+function formatDate(date) {
+  return date.toLocaleDateString('en-GB', { year: 'numeric', month: 'long', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric', timeZoneName: 'short', timeZone: 'UTC' });
+}
+
+function toISODateWithoutMilliseconds(date) {
+  return date.toISOString().replace(/\.\d+/, '');
 }
