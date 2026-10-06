@@ -1,0 +1,73 @@
+{
+  "name": "@opentermsarchive/issue-reporter",
+  "version": "0.0.0",
+  "description": "Reports the tracking failures of an Open Terms Archive collection as issues on GitHub or GitLab",
+  "homepage": "https://opentermsarchive.org",
+  "bugs": {
+    "url": "https://github.com/OpenTermsArchive/issue-reporter/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/OpenTermsArchive/issue-reporter.git"
+  },
+  "license": "EUPL-1.2",
+  "author": "Open Terms Archive contributors",
+  "type": "module",
+  "bin": {
+    "ota-issue-reporter": "./bin/ota-issue-reporter.js"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "bin",
+    "config",
+    "!config/development.json",
+    "!config/local.json",
+    "src",
+    "!src/**/*.test.js"
+  ],
+  "scripts": {
+    "commit-messages:lint": "commitlint --from=main --to=HEAD",
+    "lint": "eslint src bin test",
+    "lint:fix": "npm run lint -- --fix",
+    "start": "node bin/ota-issue-reporter.js sync",
+    "start:schedule": "npm start -- --schedule",
+    "test": "cross-env NODE_ENV=test mocha --recursive \"./src/**/*.test.js\" --exit",
+    "posttest": "npm run lint",
+    "test:only": "cross-env NODE_ENV=test mocha --recursive"
+  },
+  "dependencies": {
+    "commander": "^14.0.1",
+    "config": "^4.1.1",
+    "croner": "^9.1.0",
+    "cronstrue": "^3.3.0",
+    "dotenv": "^17.2.2",
+    "http-proxy-agent": "^7.0.2",
+    "https-proxy-agent": "^7.0.6",
+    "mime": "^4.1.0",
+    "node-fetch": "^3.3.2",
+    "octokit": "^5.0.3",
+    "winston": "^3.17.0",
+    "winston-mail": "^2.0.0"
+  },
+  "devDependencies": {
+    "@commitlint/cli": "^19.8.1",
+    "chai": "^6.0.1",
+    "chai-as-promised": "^8.0.2",
+    "cross-env": "^10.0.0",
+    "eslint": "^8.53.0",
+    "eslint-config-airbnb-base": "^15.0.0",
+    "eslint-plugin-chai-friendly": "^1.1.0",
+    "eslint-plugin-import": "^2.32.0",
+    "eslint-plugin-json-format": "^2.0.1",
+    "eslint-plugin-no-only-tests": "^3.3.0",
+    "mocha": "^11.7.2",
+    "nock": "^14.0.10",
+    "sinon": "^21.0.0",
+    "sinon-chai": "^4.0.1"
+  },
+  "engines": {
+    "node": ">=22 <=26"
+  }
+}
