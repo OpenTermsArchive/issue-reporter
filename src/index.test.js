@@ -145,9 +145,9 @@ describe('Reporter', () => {
       it('omits its snapshot link and keeps the ones of the recorded documents', () => {
         const description = buildReporter().generateDescription(buildResult({ sourceCount: 3, withoutSnapshotIndexes: [1] }));
 
-        expect(description).to.include('[source-0]');
-        expect(description).to.not.include('[source-1]');
-        expect(description).to.include('[source-2]');
+        expect(description).to.include('test-snapshots/blob/main/TestService/Terms%20of%20Service%20%23source-0.html');
+        expect(description).to.not.include('%23source-1');
+        expect(description).to.include('test-snapshots/blob/main/TestService/Terms%20of%20Service%20%23source-2.html');
         expect(description).to.not.include('.null');
       });
     });
