@@ -6,6 +6,7 @@ import logger from './logger.js';
 
 const CONTRIBUTION_TOOL_URL = 'https://contribute.opentermsarchive.org/en/service';
 const DOC_URL = 'https://docs.opentermsarchive.org';
+const TERMS_TYPE_AND_DOCUMENT_ID_SEPARATOR = ' #'; // Mirrors the naming convention of the snapshot files of combined terms in the engine, which this module cannot import
 
 export const STATUSES = Object.freeze({ ok: 'ok', failed: 'failed' }); // Statuses of a tracking result, as the Collection API serves them
 
@@ -139,7 +140,7 @@ export default class Reporter {
 
     if (recordedSourceDocuments.length) {
       latestSnapshotsLink = hasMultipleSourceDocuments
-        ? `Latest snapshots:\n  - ${recordedSourceDocuments.map(sourceDocument => `[${sourceDocument.id}](${snapshotsBaseUrl}.%20#${sourceDocument.id}.${mime.getExtension(sourceDocument.mimeType)})`).join('\n  - ')}`
+        ? `Latest snapshots:\n  - ${recordedSourceDocuments.map(sourceDocument => `[${sourceDocument.id}](${snapshotsBaseUrl}${encodeURIComponent(`${TERMS_TYPE_AND_DOCUMENT_ID_SEPARATOR}${sourceDocument.id}`)}.${mime.getExtension(sourceDocument.mimeType)})`).join('\n  - ')}`
         : `[Latest snapshot](${snapshotsBaseUrl}.${mime.getExtension(recordedSourceDocuments[0].mimeType)})`;
     }
 
