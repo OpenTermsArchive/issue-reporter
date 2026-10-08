@@ -1,0 +1,36 @@
+name: Test
+
+on:
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        operating_system:
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
+        node_version:
+          - 22
+          - 26
+        exclude:
+          - operating_system: windows-latest
+            node_version: 22
+          - operating_system: macos-latest
+            node_version: 22
+      fail-fast: false # run tests on other operating systems even if one fails
+
+    runs-on: ${{ matrix.operating_system }}
+
+    steps:
+      - run: |
+          git config --global core.autocrlf false
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node_version }}
+      - run: npm ci
+      - run: npm test

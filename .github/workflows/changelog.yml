@@ -1,0 +1,9 @@
+name: Changelog
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  validate:
+    uses: OpenTermsArchive/shared-workflows/.github/workflows/changelog.yml@4565230eda2a36c5270784cd73452743dc0a69ed # v0.2.0

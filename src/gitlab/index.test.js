@@ -10,12 +10,26 @@ describe('GitLab', function () {
 
   let MANAGED_LABELS;
   let gitlab;
-  const PROJECT_ID = '4';
+  const PROJECT_ID = 4;
   const REPOSITORIES = { declarations: 'owner/repo', versions: 'owner/versions-repo', snapshots: 'owner/snapshots-repo' };
+  const ISSUES_QUERY = { scope: 'all', state: GitLab.ISSUE_STATE_ALL, per_page: '100', page: '1' };
+  const EXISTING_OPEN_ISSUE = { iid: 1, title: 'Opened issue', description: 'Issue description', state: GitLab.ISSUE_STATE_OPEN, labels: [LABELS.HTTP_403.name], created_at: '2024-01-01T00:00:00Z', web_url: 'https://gitlab.com/owner/repo/-/issues/1' };
+  const EXISTING_CLOSED_ISSUE = { iid: 2, title: 'Closed issue', description: 'Issue description', state: GitLab.ISSUE_STATE_CLOSED, labels: [LABELS.EMPTY_CONTENT.name], created_at: '2024-01-02T00:00:00Z', web_url: 'https://gitlab.com/owner/repo/-/issues/2' };
+  const asGitLabLabel = label => ({ ...label, color: `#${label.color}`, description: `${label.description} ${MANAGED_BY_OTA_MARKER}` }); // GitLab lists label colors with a leading hash and the managed labels carry the marker in their description
 
-  before(() => {
+  function mockIssuesListing(issues = [ EXISTING_OPEN_ISSUE, EXISTING_CLOSED_ISSUE ]) {
+    return nock(gitlab.apiBaseURL)
+      .get(`/projects/${PROJECT_ID}/issues`)
+      .query(ISSUES_QUERY)
+      .reply(200, issues);
+  }
+
+  before(async () => {
     MANAGED_LABELS = Object.values(LABELS);
     gitlab = new GitLab(REPOSITORIES);
+    gitlab.projectId = PROJECT_ID;
+    mockIssuesListing();
+    await gitlab.loadIssues();
   });
 
   describe('#initialize', () => {
@@ -23,10 +37,7 @@ describe('GitLab', function () {
       const scopes = [];
 
       before(async () => {
-        const existingLabels = MANAGED_LABELS.slice(0, -2).map(label => ({
-          ...label,
-          description: `${label.description} ${MANAGED_BY_OTA_MARKER}`,
-        }));
+        const existingLabels = MANAGED_LABELS.slice(0, -2).map(asGitLabLabel);
 
         nock(gitlab.apiBaseURL)
           .get(`/projects/${encodeURIComponent('owner/repo')}`)
@@ -40,7 +51,7 @@ describe('GitLab', function () {
 
         for (const label of missingLabels) {
           scopes.push(nock(gitlab.apiBaseURL)
-            .post(`/projects/${PROJECT_ID}/labels`)
+            .post(`/projects/${PROJECT_ID}/labels`, body => body.name === label.name)
             .reply(200, { name: label.name }));
         }
 
@@ -48,6 +59,10 @@ describe('GitLab', function () {
       });
 
       after(nock.cleanAll);
+
+      it('resolves the project ID', () => {
+        expect(gitlab.projectId).to.equal(PROJECT_ID);
+      });
 
       it('should create missing labels', () => {
         scopes.forEach(scope => expect(scope.isDone()).to.be.true);
@@ -59,10 +74,7 @@ describe('GitLab', function () {
 
       before(async () => {
         const existingLabels = [
-          ...MANAGED_LABELS.map(label => ({
-            ...label,
-            description: `${label.description} ${MANAGED_BY_OTA_MARKER}`,
-          })),
+          ...MANAGED_LABELS.map(asGitLabLabel),
           // Add an obsolete label that should be removed
           {
             name: 'obsolete label',
@@ -82,15 +94,12 @@ describe('GitLab', function () {
         // Mock the delete call for the obsolete label
         deleteScopes.push(nock(gitlab.apiBaseURL)
           .delete(`/projects/${PROJECT_ID}/labels/${encodeURIComponent('obsolete label')}`)
-          .reply(200));
+          .reply(204));
 
         // Mock the second getRepositoryLabels call after deletion
         nock(gitlab.apiBaseURL)
           .get(`/projects/${PROJECT_ID}/labels?with_counts=true`)
-          .reply(200, MANAGED_LABELS.map(label => ({
-            ...label,
-            description: `${label.description} ${MANAGED_BY_OTA_MARKER}`,
-          })));
+          .reply(200, MANAGED_LABELS.map(asGitLabLabel));
 
         await gitlab.initialize();
       });
@@ -120,14 +129,8 @@ describe('GitLab', function () {
           .persist()
           .get(`/projects/${PROJECT_ID}/labels?with_counts=true`)
           .reply(200, [
-            ...MANAGED_LABELS.slice(0, -2).map(label => ({
-              ...label,
-              description: `${label.description} ${MANAGED_BY_OTA_MARKER}`,
-            })),
-            ...testLabels.map(label => ({
-              ...label,
-              description: `${label.description} ${MANAGED_BY_OTA_MARKER}`,
-            })),
+            ...MANAGED_LABELS.slice(0, -2).map(asGitLabLabel),
+            ...testLabels.map(asGitLabLabel),
           ]);
 
         for (const label of originalTestLabels) {
@@ -147,6 +150,77 @@ describe('GitLab', function () {
       it('should update labels with changed descriptions', () => {
         updateScopes.forEach(scope => expect(scope.isDone()).to.be.true);
       });
+    });
+
+    context('when the project cannot be resolved', () => {
+      before(() => {
+        nock(gitlab.apiBaseURL)
+          .get(`/projects/${encodeURIComponent('owner/repo')}`)
+          .reply(404, { message: '404 Project Not Found' });
+      });
+
+      after(nock.cleanAll);
+
+      it('rejects rather than carrying on without a project', async () => {
+        await expect(gitlab.initialize()).to.be.rejectedWith('status 404');
+      });
+    });
+
+    context('when the token is rejected', () => {
+      before(() => {
+        nock(gitlab.apiBaseURL)
+          .get(`/projects/${encodeURIComponent('owner/repo')}`)
+          .reply(200, { id: PROJECT_ID });
+
+        nock(gitlab.apiBaseURL)
+          .get(`/projects/${PROJECT_ID}/labels?with_counts=true`)
+          .reply(401, { message: '401 Unauthorized' });
+      });
+
+      after(nock.cleanAll);
+
+      it('rejects rather than failing at every synchronization', async () => {
+        await expect(gitlab.initialize()).to.be.rejectedWith('status 401');
+      });
+    });
+  });
+
+  describe('#loadIssues', () => {
+    const OLDER_DUPLICATE = { iid: 3, title: 'Duplicated issue', state: GitLab.ISSUE_STATE_OPEN, labels: [], created_at: '2023-01-01T00:00:00Z' };
+    const NEWER_DUPLICATE = { iid: 4, title: 'Duplicated issue', state: GitLab.ISSUE_STATE_OPEN, labels: [], created_at: '2023-06-01T00:00:00Z' };
+    const SECOND_PAGE_ISSUE = { iid: 5, title: 'Issue on the second page', state: GitLab.ISSUE_STATE_OPEN, labels: [], created_at: '2023-06-01T00:00:00Z' };
+    let issues;
+
+    before(async () => {
+      nock(gitlab.apiBaseURL)
+        .get(`/projects/${PROJECT_ID}/issues`)
+        .query(ISSUES_QUERY)
+        .reply(200, [ NEWER_DUPLICATE, OLDER_DUPLICATE ], { 'x-next-page': '2' });
+
+      nock(gitlab.apiBaseURL)
+        .get(`/projects/${PROJECT_ID}/issues`)
+        .query({ ...ISSUES_QUERY, page: '2' })
+        .reply(200, [SECOND_PAGE_ISSUE], { 'x-next-page': '' });
+
+      issues = await gitlab.loadIssues();
+    });
+
+    after(async () => {
+      nock.cleanAll();
+      mockIssuesListing();
+      await gitlab.loadIssues();
+    });
+
+    it('drops the issues loaded before', () => {
+      expect(issues.has(EXISTING_OPEN_ISSUE.title)).to.be.false;
+    });
+
+    it('keeps the oldest of the issues sharing a title', () => {
+      expect(issues.get(OLDER_DUPLICATE.title)).to.deep.equal(OLDER_DUPLICATE);
+    });
+
+    it('loads every page', () => {
+      expect(issues.get(SECOND_PAGE_ISSUE.title)).to.deep.equal(SECOND_PAGE_ISSUE);
     });
   });
 
@@ -171,6 +245,22 @@ describe('GitLab', function () {
 
     it('returns the repository labels', () => {
       expect(result).to.deep.equal(LABELS);
+    });
+
+    it('rejects when GitLab fails', async () => {
+      nock(gitlab.apiBaseURL)
+        .get(`/projects/${PROJECT_ID}/labels?with_counts=true`)
+        .reply(500, { message: 'Internal Server Error' });
+
+      await expect(gitlab.getRepositoryLabels()).to.be.rejectedWith('status 500');
+    });
+
+    it('rejects with the status when GitLab answers with a non-JSON body', async () => {
+      nock(gitlab.apiBaseURL)
+        .get(`/projects/${PROJECT_ID}/labels?with_counts=true`)
+        .reply(502, '<html><body>Bad Gateway</body></html>');
+
+      await expect(gitlab.getRepositoryLabels()).to.be.rejectedWith('status 502');
     });
   });
 
@@ -212,13 +302,16 @@ describe('GitLab', function () {
 
     before(async () => {
       scope = nock(gitlab.apiBaseURL)
-        .post(`/projects/${PROJECT_ID}/issues`)
+        .post(`/projects/${PROJECT_ID}/issues`, ISSUE)
         .reply(200, CREATED_ISSUE);
 
       result = await gitlab.createIssue(ISSUE);
     });
 
-    after(nock.cleanAll);
+    after(() => {
+      nock.cleanAll();
+      gitlab.issuesCache.delete(ISSUE.title);
+    });
 
     it('creates the new issue', () => {
       expect(scope.isDone()).to.be.true;
@@ -229,125 +322,55 @@ describe('GitLab', function () {
     });
   });
 
-  describe('#setIssueLabels', () => {
-    let scope;
-    const issue = {
-      iid: 123,
-      title: 'test issue',
-    };
-    const labels = [ 'bug', 'enhancement' ];
+  describe('#updateIssue', () => {
+    const ISSUE = { iid: 123, title: 'Issue to update' };
 
-    const response = {
-      iid: 123,
-      labels,
-    };
-
-    before(async () => {
-      scope = nock(gitlab.apiBaseURL)
-        .put(`/projects/${PROJECT_ID}/issues/${issue.iid}`, { labels })
-        .reply(200, response);
-
-      await gitlab.setIssueLabels({ issue, labels });
+    afterEach(() => {
+      nock.cleanAll();
+      gitlab.issuesCache.delete(ISSUE.title);
     });
 
-    after(nock.cleanAll);
+    it('sets the labels of the issue', async () => {
+      const labels = [ 'bug', 'enhancement' ];
+      const scope = nock(gitlab.apiBaseURL)
+        .put(`/projects/${PROJECT_ID}/issues/${ISSUE.iid}`, { labels })
+        .reply(200, { ...ISSUE, labels });
 
-    it('sets labels on the issue', () => {
+      await gitlab.updateIssue(ISSUE, { labels });
+
       expect(scope.isDone()).to.be.true;
     });
-  });
 
-  describe('#openIssue', () => {
-    let scope;
-    const ISSUE = { iid: 123, title: 'issue reopened' };
-    const EXPECTED_REQUEST_BODY = { state_event: 'reopen' };
-    const response = { iid: 123 };
+    it('changes the state of the issue through a state event', async () => {
+      const scope = nock(gitlab.apiBaseURL)
+        .put(`/projects/${PROJECT_ID}/issues/${ISSUE.iid}`, { state_event: 'close' })
+        .reply(200, { ...ISSUE, state: GitLab.ISSUE_STATE_CLOSED });
 
-    before(async () => {
-      scope = nock(gitlab.apiBaseURL)
-        .put(`/projects/${PROJECT_ID}/issues/${ISSUE.iid}`, EXPECTED_REQUEST_BODY)
-        .reply(200, response);
+      await gitlab.updateIssue(ISSUE, { stateEvent: 'close' });
 
-      await gitlab.openIssue(ISSUE);
-    });
-
-    after(nock.cleanAll);
-
-    it('opens the issue', () => {
       expect(scope.isDone()).to.be.true;
     });
-  });
 
-  describe('#closeIssue', () => {
-    let scope;
-    const ISSUE = { iid: 123, title: 'close issue' };
-    const EXPECTED_REQUEST_BODY = { state_event: 'close' };
-    const response = { iid: 123 };
+    it('rejects when GitLab fails', async () => {
+      nock(gitlab.apiBaseURL)
+        .put(`/projects/${PROJECT_ID}/issues/${ISSUE.iid}`)
+        .reply(403, { message: '403 Forbidden' });
 
-    before(async () => {
-      scope = nock(gitlab.apiBaseURL)
-        .put(`/projects/${PROJECT_ID}/issues/${ISSUE.iid}`, EXPECTED_REQUEST_BODY)
-        .reply(200, response);
-
-      await gitlab.closeIssue(ISSUE);
-    });
-
-    after(nock.cleanAll);
-
-    it('closes the issue', () => {
-      expect(scope.isDone()).to.be.true;
+      await expect(gitlab.updateIssue(ISSUE, { stateEvent: 'close' })).to.be.rejectedWith('status 403');
     });
   });
 
   describe('#getIssue', () => {
-    let scope;
-    let result;
-
-    const ISSUE = { number: 123, title: 'Test Issue' };
-    const ANOTHER_ISSUE = { number: 124, title: 'Test Issue 2' };
-
-    before(async () => {
-      scope = nock(gitlab.apiBaseURL)
-        .get(`/projects/${PROJECT_ID}/issues?search=${encodeURIComponent(ISSUE.title)}&per_page=100`)
-        .reply(200, [ ISSUE, ANOTHER_ISSUE ]);
-
-      result = await gitlab.getIssue({ title: ISSUE.title, state: GitLab.ISSUE_STATE_ALL });
+    context('when the issue exists in the cache', () => {
+      it('returns the cached issue', async () => {
+        expect(await gitlab.getIssue(EXISTING_OPEN_ISSUE.title)).to.deep.equal(EXISTING_OPEN_ISSUE);
+      });
     });
 
-    after(nock.cleanAll);
-
-    it('searches for the issue', () => {
-      expect(scope.isDone()).to.be.true;
-    });
-
-    it('returns the expected issue', () => {
-      expect(result).to.deep.equal(ISSUE);
-    });
-  });
-
-  describe('#getIssueWithStatus', () => {
-    let scope;
-    let result;
-
-    const ISSUE = { number: 123, title: 'Test Issue', state: 'opened' };
-    const ANOTHER_ISSUE = { number: 124, title: 'Test Issue 2', state: 'opened' };
-
-    before(async () => {
-      scope = nock(gitlab.apiBaseURL)
-        .get(`/projects/${PROJECT_ID}/issues?search=${encodeURIComponent(ISSUE.title)}&state=${GitLab.ISSUE_STATE_OPEN}&per_page=100`)
-        .reply(200, [ ISSUE, ANOTHER_ISSUE ]);
-
-      result = await gitlab.getIssue({ title: ISSUE.title, state: GitLab.ISSUE_STATE_OPEN });
-    });
-
-    after(nock.cleanAll);
-
-    it('searches for the issue', () => {
-      expect(scope.isDone()).to.be.true;
-    });
-
-    it('returns the expected issue', () => {
-      expect(result).to.deep.equal(ISSUE);
+    context('when the issue does not exist in the cache', () => {
+      it('returns undefined', async () => {
+        expect(await gitlab.getIssue('Non-existent Issue')).to.be.undefined;
+      });
     });
   });
 
@@ -373,35 +396,28 @@ describe('GitLab', function () {
   });
 
   describe('#closeIssueWithCommentIfExists', () => {
+    const COMMENT = 'Closing comment';
+
     after(nock.cleanAll);
 
     context('when the issue exists and is open', () => {
-      const ISSUE = {
-        iid: 123,
-        title: 'Open Issue',
-        state: GitLab.ISSUE_STATE_OPEN,
-      };
       let addCommentScope;
       let closeIssueScope;
-      const COMMENT = 'Closing comment';
-      const responseAddcomment = { iid: 123, id: 23, body: COMMENT };
-      const closeissueBody = { state_event: 'close' };
-      const responseCloseissue = { iid: 123 };
 
       before(async () => {
-        nock(gitlab.apiBaseURL)
-          .get(`/projects/${PROJECT_ID}/issues?search=${encodeURIComponent(ISSUE.title)}&state=${GitLab.ISSUE_STATE_OPEN}&per_page=100`)
-          .reply(200, [ISSUE]);
-
         addCommentScope = nock(gitlab.apiBaseURL)
-          .post(`/projects/${PROJECT_ID}/issues/${ISSUE.iid}/notes`, { body: COMMENT })
-          .reply(200, responseAddcomment);
+          .post(`/projects/${PROJECT_ID}/issues/${EXISTING_OPEN_ISSUE.iid}/notes`, { body: COMMENT })
+          .reply(200, { iid: EXISTING_OPEN_ISSUE.iid, id: 23, body: COMMENT });
 
         closeIssueScope = nock(gitlab.apiBaseURL)
-          .put(`/projects/${PROJECT_ID}/issues/${ISSUE.iid}`, closeissueBody)
-          .reply(200, responseCloseissue);
+          .put(`/projects/${PROJECT_ID}/issues/${EXISTING_OPEN_ISSUE.iid}`, { state_event: 'close' })
+          .reply(200, { ...EXISTING_OPEN_ISSUE, state: GitLab.ISSUE_STATE_CLOSED });
 
-        await gitlab.closeIssueWithCommentIfExists({ title: ISSUE.title, comment: COMMENT });
+        await gitlab.closeIssueWithCommentIfExists({ title: EXISTING_OPEN_ISSUE.title, comment: COMMENT });
+      });
+
+      after(() => {
+        gitlab.issuesCache.set(EXISTING_OPEN_ISSUE.title, EXISTING_OPEN_ISSUE);
       });
 
       it('adds comment to the issue', () => {
@@ -414,32 +430,19 @@ describe('GitLab', function () {
     });
 
     context('when the issue exists and is closed', () => {
-      const ISSUE = {
-        number: 123,
-        title: 'Closed Issue',
-        state: GitLab.ISSUE_STATE_CLOSED,
-      };
       let addCommentScope;
       let closeIssueScope;
-      const COMMENT = 'Closing comment';
-      const responseAddcomment = { iid: 123, id: 23, body: COMMENT };
-      const closeissueBody = { state_event: 'close' };
-      const responseCloseissue = { iid: 123 };
 
       before(async () => {
-        nock(gitlab.apiBaseURL)
-          .get(`/projects/${PROJECT_ID}/issues?search=${encodeURIComponent(ISSUE.title)}&per_page=100`)
-          .reply(200, []);
-
         addCommentScope = nock(gitlab.apiBaseURL)
-          .post(`/projects/${PROJECT_ID}/issues/${ISSUE.iid}/notes`, { body: COMMENT })
-          .reply(200, responseAddcomment);
+          .post(`/projects/${PROJECT_ID}/issues/${EXISTING_CLOSED_ISSUE.iid}/notes`, { body: COMMENT })
+          .reply(200);
 
         closeIssueScope = nock(gitlab.apiBaseURL)
-          .put(`/projects/${PROJECT_ID}/issues/${ISSUE.iid}`, closeissueBody)
-          .reply(200, responseCloseissue);
+          .put(`/projects/${PROJECT_ID}/issues/${EXISTING_CLOSED_ISSUE.iid}`, { state_event: 'close' })
+          .reply(200);
 
-        await gitlab.closeIssueWithCommentIfExists({ title: ISSUE.title, comment: COMMENT });
+        await gitlab.closeIssueWithCommentIfExists({ title: EXISTING_CLOSED_ISSUE.title, comment: COMMENT });
       });
 
       it('does not add comment', () => {
@@ -454,26 +457,17 @@ describe('GitLab', function () {
     context('when the issue does not exist', () => {
       let addCommentScope;
       let closeIssueScope;
-      const COMMENT = 'Closing comment';
-      const TITLE = 'Non-existent Issue';
-      const responseAddcomment = { iid: 123, id: 23, body: COMMENT };
-      const closeissueBody = { state_event: 'close' };
-      const responseCloseissue = { iid: 123 };
 
       before(async () => {
-        nock(gitlab.apiBaseURL)
-          .get(`/projects/${PROJECT_ID}/issues?search=${encodeURIComponent(TITLE)}&per_page=100`)
-          .reply(200, []);
-
         addCommentScope = nock(gitlab.apiBaseURL)
           .post(/\/projects\/\d+\/issues\/\d+\/notes/, { body: COMMENT })
-          .reply(200, responseAddcomment);
+          .reply(200);
 
         closeIssueScope = nock(gitlab.apiBaseURL)
-          .put(/\/projects\/\d+\/issues\/\d+/, closeissueBody)
-          .reply(200, responseCloseissue);
+          .put(/\/projects\/\d+\/issues\/\d+/, { state_event: 'close' })
+          .reply(200);
 
-        await gitlab.closeIssueWithCommentIfExists({ title: TITLE, comment: COMMENT });
+        await gitlab.closeIssueWithCommentIfExists({ title: 'Non-existent Issue', comment: COMMENT });
       });
 
       it('does not attempt to add comment', () => {
@@ -487,20 +481,6 @@ describe('GitLab', function () {
   });
 
   describe('#createOrUpdateIssue', () => {
-    before(async () => {
-      nock(gitlab.apiBaseURL)
-        .get(`/projects/${encodeURIComponent('owner/repo')}`)
-        .reply(200, { id: 4 });
-
-      nock(gitlab.apiBaseURL)
-        .get(`/projects/${PROJECT_ID}/labels?with_counts=true`)
-        .reply(200, MANAGED_LABELS);
-
-      await gitlab.initialize();
-    });
-
-    after(nock.cleanAll);
-
     context('when the issue does not exist', () => {
       let createIssueScope;
       const ISSUE_TO_CREATE = {
@@ -510,22 +490,16 @@ describe('GitLab', function () {
       };
 
       before(async () => {
-        nock(gitlab.apiBaseURL)
-          .get(`/projects/${PROJECT_ID}/issues?search=${encodeURIComponent(ISSUE_TO_CREATE.title)}&per_page=100`)
-          .reply(200, []); // Simulate that there is no issues on the repository
-
         createIssueScope = nock(gitlab.apiBaseURL)
-          .post(
-            `/projects/${PROJECT_ID}/issues`,
-            {
-              title: ISSUE_TO_CREATE.title,
-              description: ISSUE_TO_CREATE.description,
-              labels: ISSUE_TO_CREATE.labels,
-            },
-          )
-          .reply(200, { iid: 123, web_url: 'https://example.com/test/test' });
+          .post(`/projects/${PROJECT_ID}/issues`, ISSUE_TO_CREATE)
+          .reply(200, { iid: 123, title: ISSUE_TO_CREATE.title, web_url: 'https://example.com/test/test' });
 
         await gitlab.createOrUpdateIssue(ISSUE_TO_CREATE);
+      });
+
+      after(() => {
+        nock.cleanAll();
+        gitlab.issuesCache.delete(ISSUE_TO_CREATE.title);
       });
 
       it('creates the issue', () => {
@@ -534,60 +508,34 @@ describe('GitLab', function () {
     });
 
     context('when the issue already exists', () => {
-      const ISSUE = {
-        title: 'Existing Issue',
-        description: 'New comment',
-        labels: [LABELS.HTTP_403.name],
-      };
+      const DESCRIPTION = 'New comment';
+
+      afterEach(() => { // The adapter keeps the issues it updates, so each context starts from the issues as loaded
+        gitlab.issuesCache.set(EXISTING_OPEN_ISSUE.title, EXISTING_OPEN_ISSUE);
+        gitlab.issuesCache.set(EXISTING_CLOSED_ISSUE.title, EXISTING_CLOSED_ISSUE);
+      });
+
+      after(nock.cleanAll);
 
       context('when issue is closed', () => {
-        let setIssueLabelsScope;
+        let updateIssueScope;
         let addCommentScope;
-        let openIssueScope;
-
-        const GITLAB_RESPONSE_FOR_EXISTING_ISSUE = {
-          iid: 123,
-          title: ISSUE.title,
-          description: ISSUE.description,
-          labels: [{ name: LABELS.EMPTY_CONTENT.name }],
-          state: GitLab.ISSUE_STATE_CLOSED,
-        };
-
-        const EXPECTED_REQUEST_BODY = { state_event: 'reopen' };
-        const responseIssuereopened = { iid: 123 };
-        const responseSetLabels = {
-          iid: 123,
-          labels: [LABELS.HTTP_403.name],
-        };
-        const responseAddcomment = { iid: 123, id: 23, body: ISSUE.description };
-        const { iid } = GITLAB_RESPONSE_FOR_EXISTING_ISSUE;
 
         before(async () => {
-          nock(gitlab.apiBaseURL)
-            .get(`/projects/${PROJECT_ID}/issues?search=${encodeURIComponent(ISSUE.title)}&per_page=100`)
-            .reply(200, [GITLAB_RESPONSE_FOR_EXISTING_ISSUE]);
-
-          openIssueScope = nock(gitlab.apiBaseURL)
-            .put(`/projects/${PROJECT_ID}/issues/${iid}`, EXPECTED_REQUEST_BODY)
-            .reply(200, responseIssuereopened);
-
-          setIssueLabelsScope = nock(gitlab.apiBaseURL)
-            .put(`/projects/${PROJECT_ID}/issues/${iid}`, { labels: [LABELS.HTTP_403.name] })
-            .reply(200, responseSetLabels);
+          nock.cleanAll(); // Interceptors left by the previous contexts would answer instead of the ones of this context
+          updateIssueScope = nock(gitlab.apiBaseURL)
+            .put(`/projects/${PROJECT_ID}/issues/${EXISTING_CLOSED_ISSUE.iid}`, { state_event: 'reopen', labels: [LABELS.HTTP_403.name] })
+            .reply(200, { ...EXISTING_CLOSED_ISSUE, state: GitLab.ISSUE_STATE_OPEN, labels: [LABELS.HTTP_403.name] });
 
           addCommentScope = nock(gitlab.apiBaseURL)
-            .post(`/projects/${PROJECT_ID}/issues/${iid}/notes`, { body: ISSUE.description })
-            .reply(200, responseAddcomment);
+            .post(`/projects/${PROJECT_ID}/issues/${EXISTING_CLOSED_ISSUE.iid}/notes`, { body: DESCRIPTION })
+            .reply(200, { iid: EXISTING_CLOSED_ISSUE.iid, id: 23, body: DESCRIPTION });
 
-          await gitlab.createOrUpdateIssue(ISSUE);
+          await gitlab.createOrUpdateIssue({ title: EXISTING_CLOSED_ISSUE.title, description: DESCRIPTION, labels: [LABELS.HTTP_403.name] });
         });
 
-        it('reopens the issue', () => {
-          expect(openIssueScope.isDone()).to.be.true;
-        });
-
-        it("updates the issue's label", () => {
-          expect(setIssueLabelsScope.isDone()).to.be.true;
+        it('reopens the issue and updates its labels', () => {
+          expect(updateIssueScope.isDone()).to.be.true;
         });
 
         it('adds comment to the issue', () => {
@@ -596,54 +544,25 @@ describe('GitLab', function () {
       });
 
       context('when issue is already opened', () => {
-        let setIssueLabelsScope;
-        let addCommentScope;
-        let openIssueScope;
-
         context('when the reason is new', () => {
-          const GITLAB_RESPONSE_FOR_EXISTING_ISSUE = {
-            iid: 123,
-            title: ISSUE.title,
-            description: ISSUE.description,
-            labels: [{ name: LABELS.EMPTY_CONTENT.name }],
-            state: GitLab.ISSUE_STATE_OPEN,
-          };
-
-          const EXPECTED_REQUEST_BODY = { state_event: 'reopen' };
-          const responseIssuereopened = { iid: 123 };
-          const responseSetLabels = {
-            iid: 123,
-            labels: [LABELS.HTTP_403.name],
-          };
-          const responseAddcomment = { iid: 123, id: 23, body: ISSUE.description };
-          const { iid } = GITLAB_RESPONSE_FOR_EXISTING_ISSUE;
+          let updateIssueScope;
+          let addCommentScope;
 
           before(async () => {
-            nock(gitlab.apiBaseURL)
-              .get(`/projects/${PROJECT_ID}/issues?search=${encodeURIComponent(ISSUE.title)}&per_page=100`)
-              .reply(200, [GITLAB_RESPONSE_FOR_EXISTING_ISSUE]);
-
-            openIssueScope = nock(gitlab.apiBaseURL)
-              .put(`/projects/${PROJECT_ID}/issues/${iid}`, EXPECTED_REQUEST_BODY)
-              .reply(200, responseIssuereopened);
-
-            setIssueLabelsScope = nock(gitlab.apiBaseURL)
-              .put(`/projects/${PROJECT_ID}/issues/${iid}`, { labels: [LABELS.HTTP_403.name] })
-              .reply(200, responseSetLabels);
+            nock.cleanAll(); // Interceptors left by the previous contexts would answer instead of the ones of this context
+            updateIssueScope = nock(gitlab.apiBaseURL)
+              .put(`/projects/${PROJECT_ID}/issues/${EXISTING_OPEN_ISSUE.iid}`, { labels: [LABELS.EMPTY_CONTENT.name] })
+              .reply(200, { ...EXISTING_OPEN_ISSUE, labels: [LABELS.EMPTY_CONTENT.name] });
 
             addCommentScope = nock(gitlab.apiBaseURL)
-              .post(`/projects/${PROJECT_ID}/issues/${iid}/notes`, { body: ISSUE.description })
-              .reply(200, responseAddcomment);
+              .post(`/projects/${PROJECT_ID}/issues/${EXISTING_OPEN_ISSUE.iid}/notes`, { body: DESCRIPTION })
+              .reply(200, { iid: EXISTING_OPEN_ISSUE.iid, id: 23, body: DESCRIPTION });
 
-            await gitlab.createOrUpdateIssue(ISSUE);
+            await gitlab.createOrUpdateIssue({ title: EXISTING_OPEN_ISSUE.title, description: DESCRIPTION, labels: [LABELS.EMPTY_CONTENT.name] });
           });
 
-          it('does not change the issue state', () => {
-            expect(openIssueScope.isDone()).to.be.false;
-          });
-
-          it("updates the issue's label", () => {
-            expect(setIssueLabelsScope.isDone()).to.be.true;
+          it("updates the issue's labels without changing its state", () => {
+            expect(updateIssueScope.isDone()).to.be.true;
           });
 
           it('adds comment to the issue', () => {
@@ -652,50 +571,24 @@ describe('GitLab', function () {
         });
 
         context('when all requested labels are already present', () => {
-          let setIssueLabelsScope;
+          let updateIssueScope;
           let addCommentScope;
-          let openIssueScope;
-
-          const GITLAB_RESPONSE_FOR_EXISTING_ISSUE = {
-            iid: 123,
-            title: ISSUE.title,
-            description: ISSUE.description,
-            labels: [{ name: LABELS.HTTP_403.name }],
-            state: GitLab.ISSUE_STATE_OPEN,
-          };
-
-          const { iid } = GITLAB_RESPONSE_FOR_EXISTING_ISSUE;
 
           before(async () => {
-            nock(gitlab.apiBaseURL)
-              .get(`/projects/${PROJECT_ID}/issues?search=${encodeURIComponent(ISSUE.title)}&per_page=100`)
-              .reply(200, [GITLAB_RESPONSE_FOR_EXISTING_ISSUE]);
-
-            openIssueScope = nock(gitlab.apiBaseURL)
-              .put(`/projects/${PROJECT_ID}/issues/${iid}`)
-              .reply(200);
-
-            setIssueLabelsScope = nock(gitlab.apiBaseURL)
-              .put(`/projects/${PROJECT_ID}/issues/${iid}`)
+            nock.cleanAll(); // Interceptors left by the previous contexts would answer instead of the ones of this context
+            updateIssueScope = nock(gitlab.apiBaseURL)
+              .put(`/projects/${PROJECT_ID}/issues/${EXISTING_OPEN_ISSUE.iid}`)
               .reply(200);
 
             addCommentScope = nock(gitlab.apiBaseURL)
-              .post(`/projects/${PROJECT_ID}/issues/${iid}/notes`)
+              .post(`/projects/${PROJECT_ID}/issues/${EXISTING_OPEN_ISSUE.iid}/notes`)
               .reply(200);
 
-            await gitlab.createOrUpdateIssue({
-              title: ISSUE.title,
-              description: ISSUE.description,
-              labels: [LABELS.HTTP_403.name],
-            });
-          });
-
-          it('does not change the issue state', () => {
-            expect(openIssueScope.isDone()).to.be.false;
+            await gitlab.createOrUpdateIssue({ title: EXISTING_OPEN_ISSUE.title, description: DESCRIPTION, labels: [LABELS.HTTP_403.name] });
           });
 
           it('does not attempt to update the issue labels', () => {
-            expect(setIssueLabelsScope.isDone()).to.be.false;
+            expect(updateIssueScope.isDone()).to.be.false;
           });
 
           it('does not attempt to add any comment to the issue', () => {
@@ -704,65 +597,51 @@ describe('GitLab', function () {
         });
 
         context('when some but not all requested labels are present', () => {
-          let setIssueLabelsScope;
+          let updateIssueScope;
           let addCommentScope;
-          let openIssueScope;
-
-          before(() => {
-            nock.cleanAll();
-          });
-
-          const GITLAB_RESPONSE_FOR_EXISTING_ISSUE = {
-            iid: 123,
-            title: ISSUE.title,
-            description: ISSUE.description,
-            labels: [{ name: LABELS.HTTP_403.name }],
-            state: GitLab.ISSUE_STATE_OPEN,
-          };
-
-          const EXPECTED_REQUEST_BODY = { state_event: 'reopen' };
-          const responseIssuereopened = { iid: 123 };
-          const responseSetLabels = {
-            iid: 123,
-            labels: [ LABELS.HTTP_403.name, LABELS.EMPTY_CONTENT.name ],
-          };
-          const responseAddcomment = { iid: 123, id: 23, body: ISSUE.description };
-          const { iid } = GITLAB_RESPONSE_FOR_EXISTING_ISSUE;
 
           before(async () => {
-            nock(gitlab.apiBaseURL)
-              .get(`/projects/${PROJECT_ID}/issues?search=${encodeURIComponent(ISSUE.title)}&per_page=100`)
-              .reply(200, [GITLAB_RESPONSE_FOR_EXISTING_ISSUE]);
-
-            openIssueScope = nock(gitlab.apiBaseURL)
-              .put(`/projects/${PROJECT_ID}/issues/${iid}`, EXPECTED_REQUEST_BODY)
-              .reply(200, responseIssuereopened);
-
-            setIssueLabelsScope = nock(gitlab.apiBaseURL)
-              .put(`/projects/${PROJECT_ID}/issues/${iid}`, { labels: [ LABELS.HTTP_403.name, LABELS.EMPTY_CONTENT.name ] })
-              .reply(200, responseSetLabels);
+            nock.cleanAll(); // Interceptors left by the previous contexts would answer instead of the ones of this context
+            updateIssueScope = nock(gitlab.apiBaseURL)
+              .put(`/projects/${PROJECT_ID}/issues/${EXISTING_OPEN_ISSUE.iid}`, { labels: [ LABELS.HTTP_403.name, LABELS.EMPTY_CONTENT.name ] })
+              .reply(200, { ...EXISTING_OPEN_ISSUE, labels: [ LABELS.HTTP_403.name, LABELS.EMPTY_CONTENT.name ] });
 
             addCommentScope = nock(gitlab.apiBaseURL)
-              .post(`/projects/${PROJECT_ID}/issues/${iid}/notes`, { body: ISSUE.description })
-              .reply(200, responseAddcomment);
+              .post(`/projects/${PROJECT_ID}/issues/${EXISTING_OPEN_ISSUE.iid}/notes`, { body: DESCRIPTION })
+              .reply(200, { iid: EXISTING_OPEN_ISSUE.iid, id: 23, body: DESCRIPTION });
 
-            await gitlab.createOrUpdateIssue({
-              title: ISSUE.title,
-              description: ISSUE.description,
-              labels: [ LABELS.HTTP_403.name, LABELS.EMPTY_CONTENT.name ],
-            });
-          });
-
-          it('does not change the issue state', () => {
-            expect(openIssueScope.isDone()).to.be.false;
+            await gitlab.createOrUpdateIssue({ title: EXISTING_OPEN_ISSUE.title, description: DESCRIPTION, labels: [ LABELS.HTTP_403.name, LABELS.EMPTY_CONTENT.name ] });
           });
 
           it("updates the issue's labels", () => {
-            expect(setIssueLabelsScope.isDone()).to.be.true;
+            expect(updateIssueScope.isDone()).to.be.true;
           });
 
           it('adds comment to the issue', () => {
             expect(addCommentScope.isDone()).to.be.true;
+          });
+        });
+
+        context('when the issue carries labels that are not managed', () => {
+          let updateIssueScope;
+
+          before(async () => {
+            nock.cleanAll();
+            gitlab.issuesCache.set(EXISTING_OPEN_ISSUE.title, { ...EXISTING_OPEN_ISSUE, labels: [ 'custom label', LABELS.HTTP_403.name ] });
+
+            updateIssueScope = nock(gitlab.apiBaseURL)
+              .put(`/projects/${PROJECT_ID}/issues/${EXISTING_OPEN_ISSUE.iid}`, { labels: [ LABELS.EMPTY_CONTENT.name, 'custom label' ] })
+              .reply(200, { ...EXISTING_OPEN_ISSUE, labels: [ LABELS.EMPTY_CONTENT.name, 'custom label' ] });
+
+            nock(gitlab.apiBaseURL)
+              .post(`/projects/${PROJECT_ID}/issues/${EXISTING_OPEN_ISSUE.iid}/notes`)
+              .reply(200, { iid: EXISTING_OPEN_ISSUE.iid, id: 23, body: DESCRIPTION });
+
+            await gitlab.createOrUpdateIssue({ title: EXISTING_OPEN_ISSUE.title, description: DESCRIPTION, labels: [LABELS.EMPTY_CONTENT.name] });
+          });
+
+          it('keeps the labels that are not managed', () => {
+            expect(updateIssueScope.isDone()).to.be.true;
           });
         });
       });

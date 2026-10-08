@@ -1,0 +1,9 @@
+{
+  "@opentermsarchive/issue-reporter": {
+    "schedule": "*/15 * * * *",
+    "logger": {
+      "sendMailOnError": false,
+      "timestampPrefix": true
+    }
+  }
+}

@@ -1,7 +1,7 @@
 import GitHub from './github/index.js';
 import GitLab from './gitlab/index.js';
 
-export function createReporter(config) {
+export function createForge(config) {
   switch (config.type) {
   case 'github':
     return new GitHub(config.repositories);

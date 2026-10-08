@@ -2,26 +2,29 @@ import { createRequire } from 'module';
 
 import { Octokit } from 'octokit'; // eslint-disable-line import/no-unresolved
 
-import logger from '../../logger/index.js';
 import { LABELS, MANAGED_BY_OTA_MARKER, DEPRECATED_MANAGED_BY_OTA_MARKER } from '../labels.js';
+import logger from '../logger.js';
 
 const require = createRequire(import.meta.url);
 
+const AUTHENTICATION_FAILURE_STATUSES = [ 401, 403 ];
+
 export default class GitHub {
+  static TOKEN_ENVIRONMENT_VARIABLE = 'OTA_ISSUE_REPORTER_GITHUB_TOKEN';
   static ISSUE_STATE_CLOSED = 'closed';
   static ISSUE_STATE_OPEN = 'open';
   static ISSUE_STATE_ALL = 'all';
   static MAX_LABEL_DESCRIPTION_LENGTH = 100;
 
   constructor(repositories) {
-    const { version } = require('../../../package.json');
+    const { version } = require('../../package.json');
 
     this.octokit = new Octokit({
-      auth: process.env.OTA_ENGINE_GITHUB_TOKEN,
-      userAgent: `opentermsarchive/${version}`,
-      throttle: {
-        onRateLimit: () => false, // Do not retry after hitting a rate limit error
-        onSecondaryRateLimit: () => false, // Do not retry after hitting a secondary rate limit error
+      auth: process.env[GitHub.TOKEN_ENVIRONMENT_VARIABLE],
+      userAgent: `opentermsarchive-issue-reporter/${version}`,
+      throttle: { // A synchronization writes in a burst, so a rate limit is retried once after the delay GitHub asks for, then given up
+        onRateLimit: (retryAfter, options, octokit, retryCount) => retryCount < 1,
+        onSecondaryRateLimit: (retryAfter, options, octokit, retryCount) => retryCount < 1,
       },
     });
 
@@ -30,6 +33,7 @@ export default class GitHub {
     const [ owner, repo ] = repositories.declarations.split('/');
 
     this.commonParams = { owner, repo };
+    this.MANAGED_LABELS = Object.values(LABELS);
 
     this.issuesCache = new Map();
     this._issuesPromise = null;
@@ -47,11 +51,15 @@ export default class GitHub {
   clearCache() {
     this.issuesCache.clear();
     this._issuesPromise = null;
-    logger.info('Issues cache cleared');
+  }
+
+  loadIssues() { // Drops the issues known from the previous synchronization and loads them all again
+    this.clearCache();
+
+    return this.issues;
   }
 
   async initialize() {
-    this.MANAGED_LABELS = Object.values(LABELS);
     try {
       let existingLabels = await this.getRepositoryLabels();
       const labelsToRemove = existingLabels.filter(label => label.description && label.description.includes(DEPRECATED_MANAGED_BY_OTA_MARKER));
@@ -122,6 +130,10 @@ export default class GitHub {
         }
       }
     } catch (error) {
+      if (AUTHENTICATION_FAILURE_STATUSES.includes(error.status)) { // A rejected token would fail every synchronization, so it is better reported at startup
+        throw error;
+      }
+
       logger.error(`Failed to handle repository labels: ${error.message}`);
     }
   }
@@ -228,49 +240,41 @@ export default class GitHub {
   }
 
   async closeIssueWithCommentIfExists({ title, comment }) {
-    try {
-      const issue = await this.getIssue(title);
+    const issue = await this.getIssue(title);
 
-      if (!issue || issue.state == GitHub.ISSUE_STATE_CLOSED) {
-        return;
-      }
-
-      await this.addCommentToIssue({ issue, comment });
-
-      const updatedIssue = await this.updateIssue(issue, { state: GitHub.ISSUE_STATE_CLOSED });
-
-      logger.info(`Closed issue with comment #${updatedIssue.number}: ${updatedIssue.html_url}`);
-    } catch (error) {
-      logger.error(`Failed to close issue with comment "${title}": ${error.stack}`);
+    if (!issue || issue.state == GitHub.ISSUE_STATE_CLOSED) {
+      return;
     }
+
+    await this.addCommentToIssue({ issue, comment });
+
+    const updatedIssue = await this.updateIssue(issue, { state: GitHub.ISSUE_STATE_CLOSED });
+
+    logger.info(`Closed issue with comment #${updatedIssue.number}: ${updatedIssue.html_url}`);
   }
 
   async createOrUpdateIssue({ title, description, labels }) {
-    try {
-      const issue = await this.getIssue(title);
+    const issue = await this.getIssue(title);
 
-      if (!issue) {
-        const createdIssue = await this.createIssue({ title, description, labels });
+    if (!issue) {
+      const createdIssue = await this.createIssue({ title, description, labels });
 
-        return logger.info(`Created issue #${createdIssue.number} "${title}": ${createdIssue.html_url}`);
-      }
-
-      const managedLabelsNames = this.MANAGED_LABELS.map(label => label.name);
-      const labelsNotManagedToKeep = issue.labels.map(label => label.name).filter(label => !managedLabelsNames.includes(label));
-      const managedLabels = issue.labels.filter(label => managedLabelsNames.includes(label.name));
-
-      if (issue.state !== GitHub.ISSUE_STATE_CLOSED && labels.every(label => managedLabels.some(managedLabel => managedLabel.name === label))) {
-        return; // if all requested labels are already assigned to the issue, the error is redundant with the one already reported and no further action is necessary
-      }
-
-      const updatedIssue = await this.updateIssue(issue, { state: GitHub.ISSUE_STATE_OPEN, labels: [ ...labels, ...labelsNotManagedToKeep ] });
-
-      await this.addCommentToIssue({ issue, comment: description });
-
-      logger.info(`Updated issue with comment #${updatedIssue.number}: ${updatedIssue.html_url}`);
-    } catch (error) {
-      logger.error(`Failed to update issue "${title}": ${error.stack}`);
+      return logger.info(`Created issue #${createdIssue.number} "${title}": ${createdIssue.html_url}`);
     }
+
+    const managedLabelsNames = this.MANAGED_LABELS.map(label => label.name);
+    const labelsNotManagedToKeep = issue.labels.map(label => label.name).filter(label => !managedLabelsNames.includes(label));
+    const managedLabels = issue.labels.filter(label => managedLabelsNames.includes(label.name));
+
+    if (issue.state !== GitHub.ISSUE_STATE_CLOSED && labels.every(label => managedLabels.some(managedLabel => managedLabel.name === label))) {
+      return; // if all requested labels are already assigned to the issue, the error is redundant with the one already reported and no further action is necessary
+    }
+
+    const updatedIssue = await this.updateIssue(issue, { state: GitHub.ISSUE_STATE_OPEN, labels: [ ...labels, ...labelsNotManagedToKeep ] });
+
+    await this.addCommentToIssue({ issue, comment: description });
+
+    logger.info(`Updated issue with comment #${updatedIssue.number}: ${updatedIssue.html_url}`);
   }
 
   generateDeclarationURL(serviceId) {

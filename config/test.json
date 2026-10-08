@@ -1,0 +1,16 @@
+{
+  "@opentermsarchive/issue-reporter": {
+    "type": "github",
+    "repositories": {
+      "declarations": "OpenTermsArchive/test-declarations",
+      "versions": "OpenTermsArchive/test-versions",
+      "snapshots": "OpenTermsArchive/test-snapshots"
+    },
+    "collectionApi": {
+      "url": "http://127.0.0.1:3000/collection-api/v1"
+    },
+    "logger": {
+      "timestampPrefix": false
+    }
+  }
+}

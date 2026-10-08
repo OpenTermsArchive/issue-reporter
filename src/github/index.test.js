@@ -11,8 +11,8 @@ describe('GitHub', function () {
   let MANAGED_LABELS;
   let github;
   const REPOSITORIES = { declarations: 'owner/repo', versions: 'owner/versions-repo', snapshots: 'owner/snapshots-repo' };
-  const EXISTING_OPEN_ISSUE = { number: 1, title: 'Opened issue', description: 'Issue description', state: GitHub.ISSUE_STATE_OPEN, labels: [{ name: LABELS.HTTP_403.name }] };
-  const EXISTING_CLOSED_ISSUE = { number: 2, title: 'Closed issue', description: 'Issue description', state: GitHub.ISSUE_STATE_CLOSED, labels: [{ name: LABELS.EMPTY_CONTENT.name }] };
+  const EXISTING_OPEN_ISSUE = { number: 1, title: 'Opened issue', description: 'Issue description', state: GitHub.ISSUE_STATE_OPEN, labels: [{ name: LABELS.HTTP_403.name }], created_at: '2024-01-01T00:00:00Z' };
+  const EXISTING_CLOSED_ISSUE = { number: 2, title: 'Closed issue', description: 'Issue description', state: GitHub.ISSUE_STATE_CLOSED, labels: [{ name: LABELS.EMPTY_CONTENT.name }], created_at: '2024-01-02T00:00:00Z' };
 
   before(async () => {
     MANAGED_LABELS = Object.values(LABELS);
@@ -21,7 +21,7 @@ describe('GitHub', function () {
       .get('/repos/owner/repo/issues')
       .query(true)
       .reply(200, [ EXISTING_OPEN_ISSUE, EXISTING_CLOSED_ISSUE ]);
-    await github.clearCache();
+    await github.loadIssues();
   });
 
   describe('#initialize', () => {
@@ -139,6 +139,58 @@ describe('GitHub', function () {
         updateScopes.forEach(scope => expect(scope.isDone()).to.be.true);
       });
     });
+
+    context('when the token is rejected', () => {
+      before(() => {
+        nock('https://api.github.com')
+          .get('/repos/owner/repo/labels')
+          .query(true)
+          .reply(401, { message: 'Bad credentials' });
+      });
+
+      after(nock.cleanAll);
+
+      it('rejects rather than failing at every synchronization', async () => {
+        await expect(github.initialize()).to.be.rejected;
+      });
+    });
+  });
+
+  describe('#loadIssues', () => {
+    const OLDER_DUPLICATE = { number: 3, title: 'Duplicated issue', state: GitHub.ISSUE_STATE_OPEN, labels: [], created_at: '2023-01-01T00:00:00Z' };
+    const NEWER_DUPLICATE = { number: 4, title: 'Duplicated issue', state: GitHub.ISSUE_STATE_OPEN, labels: [], created_at: '2023-06-01T00:00:00Z' };
+    const PULL_REQUEST = { number: 5, title: 'Pull request', state: GitHub.ISSUE_STATE_OPEN, labels: [], created_at: '2023-06-01T00:00:00Z', pull_request: {} };
+    let issues;
+
+    before(async () => {
+      nock('https://api.github.com')
+        .get('/repos/owner/repo/issues')
+        .query(true)
+        .reply(200, [ NEWER_DUPLICATE, OLDER_DUPLICATE, PULL_REQUEST ]);
+
+      issues = await github.loadIssues();
+    });
+
+    after(async () => {
+      nock.cleanAll();
+      nock('https://api.github.com')
+        .get('/repos/owner/repo/issues')
+        .query(true)
+        .reply(200, [ EXISTING_OPEN_ISSUE, EXISTING_CLOSED_ISSUE ]);
+      await github.loadIssues();
+    });
+
+    it('drops the issues loaded before', () => {
+      expect(issues.has(EXISTING_OPEN_ISSUE.title)).to.be.false;
+    });
+
+    it('keeps the oldest of the issues sharing a title', () => {
+      expect(issues.get(OLDER_DUPLICATE.title)).to.deep.equal(OLDER_DUPLICATE);
+    });
+
+    it('ignores pull requests', () => {
+      expect(issues.has(PULL_REQUEST.title)).to.be.false;
+    });
   });
 
   describe('#getRepositoryLabels', () => {
@@ -232,13 +284,6 @@ describe('GitHub', function () {
   });
 
   describe('#getIssue', () => {
-    before(() => {
-      nock('https://api.github.com')
-        .get('/repos/owner/repo/issues')
-        .query(true)
-        .reply(200, [ EXISTING_OPEN_ISSUE, EXISTING_CLOSED_ISSUE ]);
-    });
-
     context('when the issue exists in the cache', () => {
       it('returns the cached issue', async () => {
         expect(await github.getIssue(EXISTING_OPEN_ISSUE.title)).to.deep.equal(EXISTING_OPEN_ISSUE);
@@ -294,9 +339,13 @@ describe('GitHub', function () {
 
         closeIssueScope = nock('https://api.github.com')
           .patch(`/repos/owner/repo/issues/${EXISTING_OPEN_ISSUE.number}`, { state: GitHub.ISSUE_STATE_CLOSED })
-          .reply(200);
+          .reply(200, { ...EXISTING_OPEN_ISSUE, state: GitHub.ISSUE_STATE_CLOSED });
 
         await github.closeIssueWithCommentIfExists({ title: EXISTING_OPEN_ISSUE.title, comment: 'Closing comment' });
+      });
+
+      after(() => {
+        github.issuesCache.set(EXISTING_OPEN_ISSUE.title, EXISTING_OPEN_ISSUE);
       });
 
       it('adds comment to the issue', () => {
@@ -357,13 +406,22 @@ describe('GitHub', function () {
         expect(closeIssueScope.isDone()).to.be.false;
       });
     });
+
+    context('when GitHub fails', () => {
+      before(() => {
+        nock.cleanAll(); // Interceptors left by the previous contexts would answer instead of the failure
+        nock('https://api.github.com')
+          .post(`/repos/owner/repo/issues/${EXISTING_OPEN_ISSUE.number}/comments`)
+          .reply(422, { message: 'Validation Failed' }); // A status that octokit does not retry, as the retries would reach the network
+      });
+
+      it('rejects so that the synchronization can be retried', async () => {
+        await expect(github.closeIssueWithCommentIfExists({ title: EXISTING_OPEN_ISSUE.title, comment: 'Closing comment' })).to.be.rejected;
+      });
+    });
   });
 
   describe('#createOrUpdateIssue', () => {
-    before(() => {
-      github.MANAGED_LABELS = Object.values(LABELS);
-    });
-
     context('when the issue does not exist', () => {
       let createIssueScope;
       const ISSUE_TO_CREATE = {
