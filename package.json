@@ -1,6 +1,6 @@
 {
   "name": "@opentermsarchive/issue-reporter",
-  "version": "0.0.0",
+  "version": "1.0.0",
   "description": "Reports the tracking failures of an Open Terms Archive collection as issues on GitHub or GitLab",
   "homepage": "https://opentermsarchive.org",
   "bugs": {
